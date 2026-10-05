@@ -10,7 +10,7 @@ from dotenv import load_dotenv
 from groq import Groq
 
 from src.config import RAW_DATA_PATH
-from src.indexer import VectorIndexer
+from src.hybrid_retriever import HybridRetriever
 from src.pipelines.multi_hop import MultiHopRAGPipeline
 from src.pipelines.single_hop import SingleHopRAGPipeline
 
@@ -62,7 +62,7 @@ def get_groq_llm():
 
 
 def main():
-    indexer = VectorIndexer()
+    indexer = HybridRetriever()
 
     def retriever_fn(query: str, top_k: int = 3):
         return indexer.query(query, top_k=top_k)
@@ -72,13 +72,23 @@ def main():
     single_hop_pipe = SingleHopRAGPipeline(retriever_fn, llm_fn)
     multi_hop_pipe = MultiHopRAGPipeline(retriever_fn, llm_fn)
 
+    dataset = []
     with open(RAW_DATA_PATH, "r") as f:
-        dataset = json.load(f)
+        for line in f:
+            if line.strip():
+                dataset.append(json.loads(line))
 
-    # Test on 10 queries
-    dataset = dataset[:10]
+    # Test on next 10 queries (10 to 20)
+    dataset = dataset[10:20]
 
+    from src.config import BENCHMARK_RESULTS_PATH
     results = []
+    if BENCHMARK_RESULTS_PATH.exists():
+        with open(BENCHMARK_RESULTS_PATH, "r") as f:
+            try:
+                results = json.load(f)
+            except json.JSONDecodeError:
+                results = []
 
     for i, item in enumerate(dataset):
         query = item["question"]

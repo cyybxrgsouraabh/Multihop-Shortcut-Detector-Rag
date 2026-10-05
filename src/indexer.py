@@ -53,8 +53,11 @@ class VectorIndexer:
         )
 
     def index_dataset(self, dataset_path: Path = RAW_DATA_PATH, batch_size: int = 256):
+        data = []
         with open(dataset_path, "r") as f:
-            data = json.load(f)
+            for line in f:
+                if line.strip():
+                    data.append(json.loads(line))
 
         all_docs = []
         for item in data:

@@ -13,6 +13,11 @@ def main():
     indexer.index_dataset()
     print("Vector indexing completed successfully!")
 
+    print("\nBuilding BM25 index...")
+    from src.hybrid_retriever import HybridRetriever
+    hr = HybridRetriever()
+    hr.build_bm25_index()
+
 
 if __name__ == "__main__":
     main()
