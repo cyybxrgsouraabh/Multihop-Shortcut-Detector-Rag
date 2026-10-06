@@ -76,8 +76,8 @@ class HybridRetriever:
           - bm25_scores: {doc_id: bm25_score}
           - rrf_scores: {doc_id: rrf_score}
         """
-        # 1. Dense results with distances
-        dense_results_raw = self.vector_indexer.collection.query(
+        # 1. Dense results with distances (thread-safe)
+        dense_results_raw = self.vector_indexer.query_raw(
             query_texts=[query_text],
             n_results=self.top_k,
             include=["documents", "metadatas", "distances"]

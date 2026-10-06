@@ -1,5 +1,6 @@
 import json
 from pathlib import Path
+import threading
 from typing import Any, Dict, List
 
 import chromadb
@@ -36,6 +37,8 @@ def extract_passages_from_item(item: Dict[str, Any]) -> List[Dict[str, Any]]:
 
 
 class VectorIndexer:
+    _lock = threading.Lock()
+
     def __init__(
         self,
         persist_directory: Path = CHROMA_DB_PATH,
@@ -50,6 +53,7 @@ class VectorIndexer:
         self.collection = self.client.get_or_create_collection(
             name=collection_name,
             embedding_function=self.emb_fn,
+            metadata={"hnsw:space": "cosine"},
         )
 
     def index_dataset(self, dataset_path: Path = RAW_DATA_PATH, batch_size: int = 256):
@@ -74,22 +78,29 @@ class VectorIndexer:
 
         for i in range(0, len(unique_docs), batch_size):
             batch = unique_docs[i : i + batch_size]
-            self.collection.upsert(
-                ids=[b["id"] for b in batch],
-                documents=[f"{b['title']}: {b['text']}" for b in batch],
-                metadatas=[
-                    {
-                        "title": b["title"],
-                        "source": b["source_dataset"],
-                        "parent_id": b["parent_query_id"],
-                    }
-                    for b in batch
-                ],
-            )
+            with self._lock:
+                self.collection.upsert(
+                    ids=[b["id"] for b in batch],
+                    documents=[f"{b['title']}: {b['text']}" for b in batch],
+                    metadatas=[
+                        {
+                            "title": b["title"],
+                            "source": b["source_dataset"],
+                            "parent_id": b["parent_query_id"],
+                        }
+                        for b in batch
+                    ],
+                )
             print(f"Indexed {min(i + batch_size, len(unique_docs))}/{len(unique_docs)} passages...")
 
+    def query_raw(self, query_texts: List[str], n_results: int = 3, include: List[str] = None) -> Dict[str, Any]:
+        """Thread-safe raw collection query."""
+        with self._lock:
+            return self.collection.query(query_texts=query_texts, n_results=n_results, include=include)
+
     def query(self, query_text: str, top_k: int = 3) -> List[Dict[str, Any]]:
-        results = self.collection.query(query_texts=[query_text], n_results=top_k)
+        with self._lock:
+            results = self.collection.query(query_texts=[query_text], n_results=top_k)
 
         passages = []
         if results and results["documents"]:

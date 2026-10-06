@@ -299,7 +299,7 @@ def llm_judge(llm_fn, question: str, ground_truth: str, prediction: str, f1_scor
             "judge_extracted_prediction": "",
         }
 
-    if is_refusal_or_unanswered(pred_clean) and contains_gold == 0:
+    if is_refusal_or_unanswered(pred_clean):
         return {
             "judge_score": 0,
             "judge_reasoning": f"Prediction indicates answer could not be found ('{pred_clean[:60]}...').",
@@ -396,69 +396,6 @@ def load_balanced_batch(
     return selected
 
 # ─── Main Pipeline ────────────────────────────────────────────────────────────
-
-def run_labeling(batch_size: int = None, per_dataset: int = None):
-    os.makedirs(PROCESSED_DATA_DIR, exist_ok=True)
-
-    # 1. Calculate quotas per dataset
-    if per_dataset is not None:
-        targets_per_dataset = {s: per_dataset for s in TARGET_DATASETS}
-        total_target = per_dataset * len(TARGET_DATASETS)
-    elif batch_size is not None:
-        base = batch_size // len(TARGET_DATASETS)
-        remainder = batch_size % len(TARGET_DATASETS)
-        targets_per_dataset = {s: base for s in TARGET_DATASETS}
-        # Distribute remainder across first datasets
-        for i in range(remainder):
-            targets_per_dataset[TARGET_DATASETS[i]] += 1
-        total_target = batch_size
-    else:
-        # Default: 500 rows (~167 each)
-        base = 500 // len(TARGET_DATASETS)
-        remainder = 500 % len(TARGET_DATASETS)
-        targets_per_dataset = {s: base for s in TARGET_DATASETS}
-        for i in range(remainder):
-            targets_per_dataset[TARGET_DATASETS[i]] += 1
-        total_target = 500
-
-    print("=" * 65)
-    print(f"BUILDING LABELING DATASET: TARGET = {total_target} ROWS")
-    print(f"Quotas: {targets_per_dataset}")
-    print("=" * 65)
-
-    # 2. Check existing records for deduplication
-    existing_ids = set()
-    existing_records = []
-    if OUTPUT_PATH.exists():
-        with open(OUTPUT_PATH, "r") as f:
-            for line in f:
-                if line.strip():
-                    rec = json.loads(line)
-                    existing_records.append(rec)
-                    if "example_id" in rec:
-                        existing_ids.add(rec["example_id"])
-                    if "id" in rec:
-                        existing_ids.add(rec["id"])
-        print(f"Found {len(existing_records)} existing records in {OUTPUT_PATH}. Deduplicating...")
-
-    # 3. Load queries
-    batch = load_balanced_batch(RAW_DATA_PATH, targets_per_dataset, existing_ids)
-    if not batch:
-        print("No new queries to process. All matching queries are already labeled.")
-        return
-
-    print(f"Total queries to evaluate in this batch: {len(batch)}\n")
-
-    # 4. Initialize Retriever and Pipelines
-    print("Loading HybridRetriever (Dense MiniLM + Sparse BM25)...")
-    retriever = HybridRetriever()
-    llm_fn = get_llm()
-
-    def retriever_fn(query: str, top_k: int = 3):
-        return retriever.query(query, top_k=top_k)
-
-    single_hop_pipe = SingleHopRAGPipeline(retriever_fn, llm_fn, max_tokens=SINGLE_HOP_MAX_TOKENS)
-    multi_hop_pipe = MultiHopRAGPipeline(retriever_fn, llm_fn, max_tokens=MULTI_HOP_MAX_TOKENS)
 
 def process_single_query(item: Dict, retriever, single_hop_pipe, multi_hop_pipe, llm_fn) -> Dict:
     """
