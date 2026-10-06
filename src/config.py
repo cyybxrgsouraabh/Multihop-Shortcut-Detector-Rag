@@ -12,5 +12,14 @@ CHROMA_DB_PATH = DATA_DIR / "processed" / "chroma_db"
 # Embedding Model
 DEFAULT_EMBEDDING_MODEL = "sentence-transformers/all-MiniLM-L6-v2"
 
-# Groq Model
-GROQ_MODEL_NAME = os.getenv("GROQ_MODEL_NAME", "qwen/qwen3.8-27b")
+# DeepSeek Model Configuration
+DEEPSEEK_MODEL_NAME = os.getenv("DEEPSEEK_MODEL_NAME", "deepseek-flash")
+DEEPSEEK_BASE_URL = os.getenv("DEEPSEEK_BASE_URL", "https://api.deepseek.com")
+
+# Generation Token Budgets (deepseek-flash uses reasoning tokens, so allocate adequate headroom)
+DEFAULT_MAX_TOKENS = 512
+SINGLE_HOP_MAX_TOKENS = 512
+MULTI_HOP_MAX_TOKENS = 768
+JUDGE_MAX_TOKENS = 512
+
+

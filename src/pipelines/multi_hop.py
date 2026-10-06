@@ -2,6 +2,7 @@ import re
 import time
 from typing import Any, Callable, Dict, List
 
+from src.config import MULTI_HOP_MAX_TOKENS
 from src.pipelines.base import BaseRAGPipeline
 
 
@@ -17,10 +18,12 @@ class MultiHopRAGPipeline(BaseRAGPipeline):
     def __init__(
         self,
         retriever_fn: Callable[[str, int], List[Dict[str, Any]]],
-        llm_generate_fn: Callable[[str, str], Dict[str, Any]],
+        llm_generate_fn: Callable[..., Dict[str, Any]],
+        max_tokens: int = MULTI_HOP_MAX_TOKENS,
     ):
         self.retriever = retriever_fn
         self.llm = llm_generate_fn
+        self.max_tokens = max_tokens
 
     def run(self, query: str, top_k: int = 3, max_steps: int = 3) -> Dict[str, Any]:
         start_time = time.time()
@@ -49,6 +52,13 @@ class MultiHopRAGPipeline(BaseRAGPipeline):
         step = 1
         final_prediction = ""
         
+        def _call_llm(p: str, sys_p: str = "") -> Dict[str, Any]:
+            time.sleep(0.3)  # brief pacing between reasoning hops
+            try:
+                return self.llm(p, system_prompt=sys_p, max_tokens=self.max_tokens)
+            except TypeError:
+                return self.llm(p, system_prompt=sys_p)
+
         # --- IR-CoT Loop ---
         while step <= max_steps:
             context_str = "\n".join(
@@ -61,7 +71,7 @@ class MultiHopRAGPipeline(BaseRAGPipeline):
                 f"Are you ready to answer? Use 'SEARCH: <query>' if missing info, or 'ANSWER: <answer>' if you have enough info."
             )
 
-            resp = self.llm(prompt, system_prompt=system_prompt)
+            resp = _call_llm(prompt, sys_p=system_prompt)
             total_prompt_tokens += resp.get("prompt_tokens", 0)
             total_completion_tokens += resp.get("completion_tokens", 0)
 
@@ -102,7 +112,7 @@ class MultiHopRAGPipeline(BaseRAGPipeline):
                 f"Context:\n{context_str}\n\n"
                 f"Based on the context, provide a concise, direct answer."
             )
-            final_resp = self.llm(final_prompt, system_prompt="Answer the question directly and concisely based on context.")
+            final_resp = _call_llm(final_prompt, sys_p="Answer the question directly and concisely based on context.")
             total_prompt_tokens += final_resp.get("prompt_tokens", 0)
             total_completion_tokens += final_resp.get("completion_tokens", 0)
             final_prediction = final_resp.get("text", "").strip()

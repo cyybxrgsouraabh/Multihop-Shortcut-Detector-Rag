@@ -1,6 +1,7 @@
 import time
 from typing import Any, Callable, Dict, List
 
+from src.config import SINGLE_HOP_MAX_TOKENS
 from src.pipelines.base import BaseRAGPipeline
 
 
@@ -14,10 +15,12 @@ class SingleHopRAGPipeline(BaseRAGPipeline):
     def __init__(
         self,
         retriever_fn: Callable[[str, int], List[Dict[str, Any]]],
-        llm_generate_fn: Callable[[str, str], Dict[str, Any]],
+        llm_generate_fn: Callable[..., Dict[str, Any]],
+        max_tokens: int = SINGLE_HOP_MAX_TOKENS,
     ):
         self.retriever = retriever_fn
         self.llm = llm_generate_fn
+        self.max_tokens = max_tokens
 
     def run(self, query: str, top_k: int = 3) -> Dict[str, Any]:
         start_time = time.time()
@@ -35,10 +38,17 @@ class SingleHopRAGPipeline(BaseRAGPipeline):
             f"Provide a concise, direct answer based strictly on the context."
         )
 
-        gen_resp = self.llm(
-            prompt,
-            system_prompt="You are a helpful and concise assistant that answers questions based on retrieved documents.",
-        )
+        try:
+            gen_resp = self.llm(
+                prompt,
+                system_prompt="You are a helpful and concise assistant that answers questions based on retrieved documents.",
+                max_tokens=self.max_tokens,
+            )
+        except TypeError:
+            gen_resp = self.llm(
+                prompt,
+                system_prompt="You are a helpful and concise assistant that answers questions based on retrieved documents.",
+            )
 
         latency = time.time() - start_time
         prompt_tokens = gen_resp.get("prompt_tokens", 0)
