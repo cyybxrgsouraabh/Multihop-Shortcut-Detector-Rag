@@ -30,6 +30,8 @@ import sys
 import time
 from collections import Counter
 from pathlib import Path
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from threading import Lock
 from typing import Any, Dict, List, Set
 
 sys.path.append(str(Path(__file__).resolve().parent.parent))
@@ -227,11 +229,84 @@ def get_llm(default_max_tokens: int = DEFAULT_MAX_TOKENS):
     return llm_fn
 
 
-def llm_judge(llm_fn, question: str, ground_truth: str, prediction: str) -> Dict[str, Any]:
+# Patterns indicating the model could not find, generate, or determine the answer
+REFUSAL_PATTERNS = [
+    r"\bcannot determine\b",
+    r"\bcan not determine\b",
+    r"\bcannot be determined\b",
+    r"\bcan not be determined\b",
+    r"\bcannot answer\b",
+    r"\bcannot be answered\b",
+    r"\bcan not be answered\b",
+    r"\bunable to determine\b",
+    r"\bunable to answer\b",
+    r"\bnot provided\b",
+    r"\bnot mentioned\b",
+    r"\bnot stated\b",
+    r"\bnot specified\b",
+    r"\bnot specify\b",
+    r"\bno information\b",
+    r"\bdoes not contain\b",
+    r"\bdo not contain\b",
+    r"\bdoes not provide\b",
+    r"\bdo not provide\b",
+    r"\bdoes not state\b",
+    r"\bdo not state\b",
+    r"\bdoes not mention\b",
+    r"\bdo not mention\b",
+    r"\binsufficient information\b",
+    r"\binsufficient context\b",
+    r"\bnot enough information\b",
+    r"\bnot enough context\b",
+    r"\bunknown from the context\b",
+    r"\bnot clear from the context\b",
+    r"\bfailed to find\b",
+    r"\bcould not find\b",
+    r"\bcould not be found\b",
+    r"\bno mention of\b",
+    r"\bno record of\b",
+    r"\bno direct information\b",
+    r"\bcontext does not\b",
+    r"\bprovided text does not\b",
+    r"\bprovided context does not\b",
+]
+
+def is_refusal_or_unanswered(text: str) -> bool:
+    """Detects any sentence implying the answer could not be found or generated."""
+    clean = text.strip()
+    if not clean:
+        return True
+    lower = clean.lower()
+    for pattern in REFUSAL_PATTERNS:
+        if re.search(pattern, lower):
+            return True
+    return False
+
+
+def llm_judge(llm_fn, question: str, ground_truth: str, prediction: str, f1_score: float = 0.0, contains_gold: int = 0) -> Dict[str, Any]:
     """
-    Anti-hallucination LLM judge with Chain-of-Thought extraction.
-    Outputs strict JSON containing extracted_prediction, reasoning, and is_correct.
+    Anti-hallucination LLM judge with Chain-of-Thought extraction:
+    1. Short-circuits any prediction where the answer was not found/generated (score 0, 0 API calls).
+    2. Sends all substantive predictions directly to DeepSeek judge for evaluation.
     """
+    pred_clean = prediction.strip()
+
+    # Rule: Empty, unanswered, or explicit refusal -> Automatically score 0 (NO API CALL)
+    if not pred_clean:
+        return {
+            "judge_score": 0,
+            "judge_reasoning": "Answer was not generated (prediction is empty).",
+            "judge_extracted_prediction": "",
+        }
+
+    if is_refusal_or_unanswered(pred_clean) and contains_gold == 0:
+        return {
+            "judge_score": 0,
+            "judge_reasoning": f"Prediction indicates answer could not be found ('{pred_clean[:60]}...').",
+            "judge_extracted_prediction": "unanswered",
+        }
+
+    # All substantive predictions are judged by DeepSeek
     prompt = (
         f"You are a strict QA evaluation judge. Your task is to assess whether a predicted answer is correct.\n\n"
         f"Question: {question}\n"
@@ -385,130 +460,204 @@ def run_labeling(batch_size: int = None, per_dataset: int = None):
     single_hop_pipe = SingleHopRAGPipeline(retriever_fn, llm_fn, max_tokens=SINGLE_HOP_MAX_TOKENS)
     multi_hop_pipe = MultiHopRAGPipeline(retriever_fn, llm_fn, max_tokens=MULTI_HOP_MAX_TOKENS)
 
+def process_single_query(item: Dict, retriever, single_hop_pipe, multi_hop_pipe, llm_fn) -> Dict:
+    """
+    Executes single-hop and multi-hop evaluations uniformly on a single query
+    with smart short-circuit judge calls.
+    """
+    qid = item["id"]
+    question = item["question"]
+    ground_truth = item["answer"]
+    source = item["source_dataset"]
+
+    # ── 1. Retrieval Signals ──
+    top_docs, raw_scores = retriever.query_with_scores(question, top_k=5)
+    top1_id = top_docs[0]["id"] if top_docs else ""
+    top1_text = top_docs[0]["text"] if top_docs else ""
+
+    dense_map = raw_scores.get("dense_score_map", {})
+    bm25_map = raw_scores.get("bm25_score_map", {})
+    rrf_map = raw_scores.get("rrf_score_map", {})
+
+    dense_sim_top1 = round(dense_map.get(top1_id, 0.0), 4)
+    bm25_score_top1 = round(bm25_map.get(top1_id, 0.0), 4)
+    rrf_score_top1 = round(rrf_map.get(top1_id, 0.0), 6)
+
+    sorted_rrf = sorted(rrf_map.items(), key=lambda x: x[1], reverse=True)
+    rrf_margin_val = rrf_margin(sorted_rrf)
+    rrf_entropy = compute_rrf_entropy(rrf_map)
+
+    ent_overlap = entity_overlap_ratio(question, top1_text)
+    all_ents_present = has_all_query_entities(question, top1_text)
+    query_token_count = len(question.split())
+    is_comp = is_comparison(question)
+    interrog_type = get_interrogative_type(question)
+    entities = extract_entities_simple(question)
+
+    retrieval_signals = {
+        "top1_doc_id": top1_id,
+        "dense_similarity_top1": dense_sim_top1,
+        "bm25_score_top1": bm25_score_top1,
+        "rrf_score_top1": rrf_score_top1,
+        "rrf_margin": rrf_margin_val,
+        "rrf_score_entropy": rrf_entropy,
+        "entity_overlap_ratio": ent_overlap,
+        "has_all_query_entities": all_ents_present,
+        "query_token_count": query_token_count,
+        "is_comparison": is_comp,
+        "interrogative_type": interrog_type,
+        "detected_entities": entities,
+    }
+
+    # ── 2. Single-Hop ──
+    sh_result = single_hop_pipe.run(question, top_k=3)
+    sh_pred = sh_result.get("prediction", "")
+    sh_f1 = compute_f1(sh_pred, ground_truth)
+    sh_em = compute_exact_match(sh_pred, ground_truth)
+    sh_contains_gold = check_contains_gold(sh_pred, ground_truth)
+
+    # Cost-optimized judge: checks refusal and verbatim match before calling LLM
+    sh_judge = llm_judge(llm_fn, question, ground_truth, sh_pred, f1_score=sh_f1, contains_gold=sh_contains_gold)
+
+    single_hop_entry = {
+        "prediction": sh_pred,
+        "retrieved_doc_ids": sh_result.get("retrieved_ids", []),
+        "f1_score": sh_f1,
+        "exact_match": sh_em,
+        "judge_score": sh_judge["judge_score"],
+        "judge_reasoning": sh_judge["judge_reasoning"],
+        "judge_extracted_prediction": sh_judge.get("judge_extracted_prediction", ""),
+        "contains_gold": sh_contains_gold,
+        "total_tokens": sh_result.get("total_tokens", 0),
+        "latency_sec": round(sh_result.get("latency_sec", 0.0), 4),
+    }
+
+    # ── 3. Multi-Hop (IR-CoT) ──
+    mh_result = multi_hop_pipe.run(question, top_k=3)
+    mh_pred = mh_result.get("prediction", "")
+    mh_f1 = compute_f1(mh_pred, ground_truth)
+    mh_em = compute_exact_match(mh_pred, ground_truth)
+    mh_contains_gold = check_contains_gold(mh_pred, ground_truth)
+
+    # Cost-optimized judge: checks refusal and verbatim match before calling LLM
+    mh_judge = llm_judge(llm_fn, question, ground_truth, mh_pred, f1_score=mh_f1, contains_gold=mh_contains_gold)
+
+    multi_hop_entry = {
+        "prediction": mh_pred,
+        "hop_queries": mh_result.get("hop_queries", []),
+        "retrieved_doc_ids": mh_result.get("retrieved_ids", []),
+        "f1_score": mh_f1,
+        "exact_match": mh_em,
+        "judge_score": mh_judge["judge_score"],
+        "judge_reasoning": mh_judge["judge_reasoning"],
+        "judge_extracted_prediction": mh_judge.get("judge_extracted_prediction", ""),
+        "contains_gold": mh_contains_gold,
+        "total_tokens": mh_result.get("total_tokens", 0),
+        "latency_sec": round(mh_result.get("latency_sec", 0.0), 4),
+    }
+
+    # ── 4. Unified Record ──
+    return {
+        "example_id": f"{source}_{qid}",
+        "dataset": source,
+        "question": question,
+        "question_type": "comparison" if is_comp else "factual",
+        "ground_truth_answer": ground_truth,
+        "retrieval_signals": retrieval_signals,
+        "single_hop": single_hop_entry,
+        "multi_hop": multi_hop_entry,
+    }
+
+
+def run_labeling(batch_size: int = None, per_dataset: int = None, workers: int = 6):
+    os.makedirs(PROCESSED_DATA_DIR, exist_ok=True)
+
+    # 1. Calculate quotas per dataset
+    if per_dataset is not None:
+        targets_per_dataset = {s: per_dataset for s in TARGET_DATASETS}
+        total_target = per_dataset * len(TARGET_DATASETS)
+    elif batch_size is not None:
+        base = batch_size // len(TARGET_DATASETS)
+        remainder = batch_size % len(TARGET_DATASETS)
+        targets_per_dataset = {s: base for s in TARGET_DATASETS}
+        for i in range(remainder):
+            targets_per_dataset[TARGET_DATASETS[i]] += 1
+        total_target = batch_size
+    else:
+        base = 500 // len(TARGET_DATASETS)
+        remainder = 500 % len(TARGET_DATASETS)
+        targets_per_dataset = {s: base for s in TARGET_DATASETS}
+        for i in range(remainder):
+            targets_per_dataset[TARGET_DATASETS[i]] += 1
+        total_target = 500
+
+    print("=" * 65)
+    print(f"BUILDING LABELING DATASET: TARGET = {total_target} ROWS (Parallel Workers: {workers})")
+    print(f"Quotas: {targets_per_dataset}")
+    print("=" * 65)
+
+    # 2. Check existing records for deduplication
+    existing_ids = set()
+    existing_records = []
+    if OUTPUT_PATH.exists():
+        with open(OUTPUT_PATH, "r") as f:
+            for line in f:
+                if line.strip():
+                    rec = json.loads(line)
+                    existing_records.append(rec)
+                    if "example_id" in rec:
+                        existing_ids.add(rec["example_id"])
+                    if "id" in rec:
+                        existing_ids.add(rec["id"])
+        print(f"Found {len(existing_records)} existing records in {OUTPUT_PATH}. Skipping those...")
+
+    # 3. Load queries
+    batch = load_balanced_batch(RAW_DATA_PATH, targets_per_dataset, existing_ids)
+    if not batch:
+        print("No new queries to process. All matching queries are already labeled.")
+        return
+
+    print(f"Total new queries to evaluate: {len(batch)}\n")
+
+    # 4. Initialize Retriever and Pipelines
+    print("Loading HybridRetriever (Dense MiniLM + Sparse BM25)...")
+    retriever = HybridRetriever()
+    llm_fn = get_llm()
+
+    def retriever_fn(query: str, top_k: int = 3):
+        return retriever.query(query, top_k=top_k)
+
+    single_hop_pipe = SingleHopRAGPipeline(retriever_fn, llm_fn, max_tokens=SINGLE_HOP_MAX_TOKENS)
+    multi_hop_pipe = MultiHopRAGPipeline(retriever_fn, llm_fn, max_tokens=MULTI_HOP_MAX_TOKENS)
+
     batch_results = []
+    file_lock = Lock()
     start_time = time.time()
+    completed_count = 0
 
-    # 5. Process queries
-    for i, item in enumerate(batch):
-        qid = item["id"]
-        question = item["question"]
-        ground_truth = item["answer"]
-        source = item["source_dataset"]
+    def worker_task(item):
+        record = process_single_query(item, retriever, single_hop_pipe, multi_hop_pipe, llm_fn)
+        nonlocal completed_count
+        with file_lock:
+            completed_count += 1
+            idx = len(existing_records) + completed_count
+            with open(OUTPUT_PATH, "a") as f:
+                f.write(json.dumps(record) + "\n")
+            sh_stat = f"SH Judge={record['single_hop']['judge_score']}"
+            mh_stat = f"MH Judge={record['multi_hop']['judge_score']}"
+            print(f"[{completed_count}/{len(batch)}] (Overall #{idx}) [{record['dataset']}] {record['question'][:50]}... -> {sh_stat}, {mh_stat}")
+        return record
 
-        overall_idx = len(existing_records) + len(batch_results) + 1
-        print(f"\n[{i+1}/{len(batch)}] (Overall #{overall_idx}) ({source}) {question[:75]}...")
-
-        # ── Retrieval Signals ──
-        top_docs, raw_scores = retriever.query_with_scores(question, top_k=5)
-        top1_id = top_docs[0]["id"] if top_docs else ""
-        top1_text = top_docs[0]["text"] if top_docs else ""
-
-        dense_map = raw_scores.get("dense_score_map", {})
-        bm25_map = raw_scores.get("bm25_score_map", {})
-        rrf_map = raw_scores.get("rrf_score_map", {})
-
-        dense_sim_top1 = round(dense_map.get(top1_id, 0.0), 4)
-        bm25_score_top1 = round(bm25_map.get(top1_id, 0.0), 4)
-        rrf_score_top1 = round(rrf_map.get(top1_id, 0.0), 6)
-
-        sorted_rrf = sorted(rrf_map.items(), key=lambda x: x[1], reverse=True)
-        rrf_margin_val = rrf_margin(sorted_rrf)
-        rrf_entropy = compute_rrf_entropy(rrf_map)
-
-        ent_overlap = entity_overlap_ratio(question, top1_text)
-        all_ents_present = has_all_query_entities(question, top1_text)
-        query_token_count = len(question.split())
-        is_comp = is_comparison(question)
-        interrog_type = get_interrogative_type(question)
-        entities = extract_entities_simple(question)
-
-        retrieval_signals = {
-            "top1_doc_id": top1_id,
-            "dense_similarity_top1": dense_sim_top1,
-            "bm25_score_top1": bm25_score_top1,
-            "rrf_score_top1": rrf_score_top1,
-            "rrf_margin": rrf_margin_val,
-            "rrf_score_entropy": rrf_entropy,
-            "entity_overlap_ratio": ent_overlap,
-            "has_all_query_entities": all_ents_present,
-            "query_token_count": query_token_count,
-            "is_comparison": is_comp,
-            "interrogative_type": interrog_type,
-            "detected_entities": entities,
-        }
-
-        # ── Single-Hop ──
-        print("  Running Single-Hop...")
-        sh_result = single_hop_pipe.run(question, top_k=3)
-        sh_pred = sh_result.get("prediction", "")
-        sh_f1 = compute_f1(sh_pred, ground_truth)
-        sh_em = compute_exact_match(sh_pred, ground_truth)
-        sh_contains_gold = check_contains_gold(sh_pred, ground_truth)
-        print(f"    -> SH Pred: {sh_pred[:50]} | F1={sh_f1} | ContainsGold={sh_contains_gold}")
-
-        print("  Running LLM judge for Single-Hop...")
-        sh_judge = llm_judge(llm_fn, question, ground_truth, sh_pred)
-        print(f"    -> SH Judge: {sh_judge['judge_score']} | Extracted: '{sh_judge.get('judge_extracted_prediction', '')}'")
-
-        single_hop_entry = {
-            "prediction": sh_pred,
-            "retrieved_doc_ids": sh_result.get("retrieved_ids", []),
-            "f1_score": sh_f1,
-            "exact_match": sh_em,
-            "judge_score": sh_judge["judge_score"],
-            "judge_reasoning": sh_judge["judge_reasoning"],
-            "judge_extracted_prediction": sh_judge.get("judge_extracted_prediction", ""),
-            "contains_gold": sh_contains_gold,
-            "total_tokens": sh_result.get("total_tokens", 0),
-            "latency_sec": round(sh_result.get("latency_sec", 0.0), 4),
-        }
-
-        # ── Multi-Hop (IR-CoT) ──
-        print("  Running Multi-Hop (IR-CoT)...")
-        mh_result = multi_hop_pipe.run(question, top_k=3)
-        mh_pred = mh_result.get("prediction", "")
-        mh_f1 = compute_f1(mh_pred, ground_truth)
-        mh_em = compute_exact_match(mh_pred, ground_truth)
-        mh_contains_gold = check_contains_gold(mh_pred, ground_truth)
-        print(f"    -> MH Pred: {mh_pred[:50]} | F1={mh_f1} | ContainsGold={mh_contains_gold}")
-
-        print("  Running LLM judge for Multi-Hop...")
-        mh_judge = llm_judge(llm_fn, question, ground_truth, mh_pred)
-        print(f"    -> MH Judge: {mh_judge['judge_score']} | Extracted: '{mh_judge.get('judge_extracted_prediction', '')}'")
-
-        multi_hop_entry = {
-            "prediction": mh_pred,
-            "hop_queries": mh_result.get("hop_queries", []),
-            "retrieved_doc_ids": mh_result.get("retrieved_ids", []),
-            "f1_score": mh_f1,
-            "exact_match": mh_em,
-            "judge_score": mh_judge["judge_score"],
-            "judge_reasoning": mh_judge["judge_reasoning"],
-            "judge_extracted_prediction": mh_judge.get("judge_extracted_prediction", ""),
-            "contains_gold": mh_contains_gold,
-            "total_tokens": mh_result.get("total_tokens", 0),
-            "latency_sec": round(mh_result.get("latency_sec", 0.0), 4),
-        }
-
-        # ── Record Creation & Atomic Append ──
-        record = {
-            "example_id": f"{source}_{qid}",
-            "dataset": source,
-            "question": question,
-            "question_type": "comparison" if is_comp else "factual",
-            "ground_truth_answer": ground_truth,
-            "retrieval_signals": retrieval_signals,
-            "single_hop": single_hop_entry,
-            "multi_hop": multi_hop_entry,
-        }
-        batch_results.append(record)
-
-        # Append immediately to JSONL so no progress is lost if interrupted
-        with open(OUTPUT_PATH, "a") as f:
-            f.write(json.dumps(record) + "\n")
-
-        print(f"  Saved record {i+1}/{len(batch)} to {OUTPUT_PATH.name}")
-        time.sleep(INTER_QUERY_DELAY)
+    # 5. Process queries in parallel
+    print(f"Starting parallel execution with {workers} worker threads...\n")
+    with ThreadPoolExecutor(max_workers=workers) as executor:
+        futures = [executor.submit(worker_task, item) for item in batch]
+        for future in as_completed(futures):
+            try:
+                res = future.result()
+                batch_results.append(res)
+            except Exception as e:
+                print(f"  [Error evaluating query]: {e}")
 
     # 6. Save Complete Combined JSON Preview
     all_records = existing_records + batch_results
@@ -517,7 +666,7 @@ def run_labeling(batch_size: int = None, per_dataset: int = None):
 
     elapsed = time.time() - start_time
     print(f"\n{'='*65}")
-    print(f"Batch completed in {elapsed/60:.1f} minutes ({elapsed/len(batch):.2f}s/query)")
+    print(f"Batch completed in {elapsed/60:.1f} minutes ({elapsed/len(batch_results):.2f}s/query)")
     print(f"  New queries added : {len(batch_results)}")
     print(f"  Total queries now : {len(all_records)}")
     print(f"  JSONL path        : {OUTPUT_PATH}")
@@ -529,6 +678,7 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Build labeling dataset in batches.")
     parser.add_argument("--batch_size", type=int, default=500, help="Total rows to add in this batch (e.g. 500, 1500, 1000)")
     parser.add_argument("--per_dataset", type=int, default=None, help="Exact quota per dataset (e.g. 167 or 500)")
+    parser.add_argument("--workers", type=int, default=6, help="Number of concurrent worker threads (default: 6)")
     args = parser.parse_args()
 
-    run_labeling(batch_size=args.batch_size, per_dataset=args.per_dataset)
+    run_labeling(batch_size=args.batch_size, per_dataset=args.per_dataset, workers=args.workers)
