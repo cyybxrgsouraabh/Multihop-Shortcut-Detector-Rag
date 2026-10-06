@@ -580,9 +580,14 @@ def run_labeling(batch_size: int = None, per_dataset: int = None, workers: int =
             idx = len(existing_records) + completed_count
             with open(OUTPUT_PATH, "a") as f:
                 f.write(json.dumps(record) + "\n")
-            sh_stat = f"SH Judge={record['single_hop']['judge_score']}"
-            mh_stat = f"MH Judge={record['multi_hop']['judge_score']}"
-            print(f"[{completed_count}/{len(batch)}] (Overall #{idx}) [{record['dataset']}] {record['question'][:50]}... -> {sh_stat}, {mh_stat}")
+            print(f"\n[{completed_count}/{len(batch)}] (Overall #{idx}) Dataset: [{record['dataset']}]")
+            print(f"Q: {record['question']}")
+            print(f"Gold Answer: {record['ground_truth_answer']}")
+            print(f"-> Single-Hop Pred: {record['single_hop']['prediction']}")
+            print(f"   SH Judge: Score={record['single_hop']['judge_score']} | Reason: {record['single_hop']['judge_reasoning']}")
+            print(f"-> Multi-Hop Pred:  {record['multi_hop']['prediction']}")
+            print(f"   MH Judge: Score={record['multi_hop']['judge_score']} | Reason: {record['multi_hop']['judge_reasoning']}")
+            print("-" * 65)
         return record
 
     # 5. Process queries in parallel
